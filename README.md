@@ -3,6 +3,10 @@
 A neural network that imitates one bullet player — both the moves and the
 time taken over them. Play it in your browser, or watch it play itself.
 
+**Play in your browser, nothing to install:** https://tflopp.github.io/maia-tim-play/
+
+Or run it locally:
+
 ## Requirements
 
 - Python 3.10 or newer
