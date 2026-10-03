@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>maia-tim</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/chessground@9.1.1/assets/chessground.base.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/chessground@9.1.1/assets/chessground.brown.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/chessground@9.1.1/assets/chessground.cburnett.css">
+<style>
+  :root { --bg:#161512; --panel:#262421; --text:#bababa; --hi:#e8e6e3; --accent:#629924;
+          --low:#c33; --muted:#7a7775; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { display:flex; gap:20px; justify-content:center; align-items:flex-start;
+         padding:20px 16px; flex-wrap:wrap; }
+  #board { width:min(560px, 92vw); height:min(560px, 92vw); }
+  .side { width:290px; display:flex; flex-direction:column; gap:12px; }
+  .panel { background:var(--panel); border-radius:6px; padding:12px; }
+  .clock { display:flex; justify-content:space-between; align-items:center;
+           background:var(--panel); border-radius:6px; padding:8px 12px; }
+  .clock .t { font:600 34px/1 ui-monospace, "Consolas", monospace; color:var(--muted); }
+  .clock.run .t { color:var(--hi); }
+  .clock.low .t { color:var(--low); }
+  .clock .who { font-weight:600; }
+  label { display:flex; justify-content:space-between; align-items:center; gap:8px; margin:6px 0; }
+  select, input[type=number] { background:#1b1a17; color:var(--hi); border:1px solid #3a3835;
+         border-radius:4px; padding:4px 6px; width:150px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:4px; padding:9px 12px;
+           font-weight:600; cursor:pointer; width:100%; }
+  button.secondary { background:#3a3835; }
+  button:disabled { opacity:.5; cursor:default; }
+  #status { min-height:20px; color:var(--hi); font-weight:600; }
+  #moves { max-height:260px; overflow-y:auto; font:13px/1.6 ui-monospace, "Consolas", monospace; }
+  #moves .row { display:grid; grid-template-columns:28px 1fr 1fr; }
+  #moves .n { color:var(--muted); }
+  #moves .think { color:var(--muted); font-size:11px; }
+  .info { color:var(--muted); font-size:12px; }
+  h1 { font-size:15px; margin:0 0 4px; color:var(--hi); }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <div>
+    <div class="clock" id="clock-top"><span class="who" id="name-top">maia-tim</span><span class="t">0:30</span></div>
+    <div id="board" style="margin:8px 0"></div>
+    <div class="clock" id="clock-bottom"><span class="who" id="name-bottom">You</span><span class="t">0:30</span></div>
+  </div>
+  <div class="side">
+    <div class="panel">
+      <h1>maia-tim</h1>
+      <div class="info" id="engine-info">loading…</div>
+    </div>
+    <div class="panel">
+      <label>Mode
+        <select id="mode"><option value="play">Play vs maia-tim</option><option value="watch">Watch it play itself</option></select></label>
+      <label>Time control
+        <select id="tc"><option value="30">30+0</option><option value="60">1+0</option></select></label>
+      <label class="play-only">You play
+        <select id="color"><option value="random">random</option><option value="white">white</option><option value="black">black</option></select></label>
+      <label title="Which era of the player to imitate: the rating at the time. Only bands the model trained on are offered."><span id="era1-label">Bot era (rating)</span>
+        <select id="rating"></select></label>
+      <label class="watch-only hidden" title="Era for the black side, so two eras can play each other.">Black era
+        <select id="rating2"></select></label>
+      <label class="play-only" title="Your rating, as the bot sees its opponent: it plays differently against stronger and weaker opponents.">Your rating
+        <input type="number" id="opp" min="900" max="3200" step="10" value="2300"></label>
+      <label title="100 = sample choices as learned; 0 = always the single most likely move.">Temperature
+        <input type="number" id="temp" min="0" max="300" step="10" value="100"></label>
+      <label title="Wait the sampled think time (incl. premove-speed answers). Off = answer instantly.">Imitate think time
+        <input type="checkbox" id="mimic" checked></label>
+      <button id="start">Start game</button>
+      <button id="resign" class="secondary" disabled style="margin-top:8px">Resign</button>
+    </div>
+    <div class="panel"><div id="status"></div></div>
+    <div class="panel"><div id="moves"></div></div>
+  </div>
+</main>
+
+<script type="module">
+import { Chessground } from 'https://cdn.jsdelivr.net/npm/chessground@9.1.1/+esm';
+import { Chess } from 'https://cdn.jsdelivr.net/npm/chess.js@1.0.0/+esm';
+
+const $ = (id) => document.getElementById(id);
+let chess, human = null, bots = new Set(), orientation = 'white', eras = {};
+let clocks, firstMoved, over = true, lastTick = 0, plyClock = [], plyThink = [];
+let tc = 30, info = {}, gameId = 0;
+
+const cg = Chessground($('board'), {
+  movable: { free: false, color: undefined, showDests: true,
+             events: { after: (orig, dest) => humanMoved(orig, dest) } },
+  premovable: { enabled: true, showDests: true },
+  draggable: { showGhost: true },
+  animation: { duration: 80 },
+  highlight: { lastMove: true, check: true },
+});
+
+fetch('/api/info').then(r => r.json()).then(i => {
+  info = i;
+  $('engine-info').textContent = `${i.version}` + (i.epoch != null ? ` · epoch ${i.epoch}` : '') +
+    (i.move_match_recent != null ? ` · ${i.move_match_recent}% move-match` : '') + ` · ${i.device}`;
+  fillEras($('rating'), i.rating_buckets, i.bucket || 50, i.default_rating);
+  fillEras($('rating2'), i.rating_buckets, i.bucket || 50, 2250);  // current-ish era vs peak
+});
+
+// Era dropdown: one option per 50-point rating band the model actually
+// trained on (with how many moves back it, when known). The model is given
+// the middle of the band.
+function fillEras(sel, buckets, step, preferred) {
+  const kfmt = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : n;
+  if (!buckets || !buckets.length) {           // training data not on this machine
+    buckets = [];
+    for (let r = 1500; r <= 2450; r += step) buckets.push({ rating: r });
+  }
+  sel.innerHTML = buckets.slice().reverse().map(b =>
+    `<option value="${b.rating + step / 2}">${b.rating}–${b.rating + step - 1}` +
+    (b.moves ? ` · ${kfmt(b.moves)}` : '') + '</option>').join('');
+  const want = buckets.find(b => preferred >= b.rating && preferred < b.rating + step);
+  sel.value = String((want || buckets[buckets.length - 1]).rating + step / 2);
+}
+const eraLabel = (sel) => sel.selectedOptions[0]?.textContent.split(' ·')[0] ?? sel.value;
+
+$('mode').onchange = () => {
+  const watch = $('mode').value === 'watch';
+  document.querySelectorAll('.play-only').forEach(e => e.classList.toggle('hidden', watch));
+  document.querySelectorAll('.watch-only').forEach(e => e.classList.toggle('hidden', !watch));
+  $('era1-label').textContent = watch ? 'White era' : 'Bot era (rating)';
+  $('resign').textContent = watch ? 'Stop' : 'Resign';
+};
+
+const s = (c) => c[0];                          // 'white' -> 'w'
+const col = (x) => (x === 'w' ? 'white' : 'black');
+const name = (x) => human && s(human) === x ? 'You' : `maia-tim (${eras[x]})`;
+
+function dests() {
+  const m = new Map();
+  for (const mv of chess.moves({ verbose: true })) {
+    if (!m.has(mv.from)) m.set(mv.from, []);
+    m.get(mv.from).push(mv.to);
+  }
+  return m;
+}
+
+function sync(lastMove) {
+  const movable = !over && human;
+  cg.set({
+    fen: chess.fen(), turnColor: col(chess.turn()), lastMove,
+    check: chess.inCheck() ? col(chess.turn()) : false,
+    movable: { color: movable ? human : undefined, dests: movable ? dests() : new Map() },
+  });
+}
+
+function fmt(ms) {
+  const t = Math.max(ms, 0) / 1000;
+  if (t < 10) return t.toFixed(1);
+  return `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
+}
+
+function renderClocks() {
+  const bottom = s(orientation), top = bottom === 'w' ? 'b' : 'w';
+  for (const [el, x] of [['clock-top', top], ['clock-bottom', bottom]]) {
+    const node = $(el);
+    node.querySelector('.t').textContent = fmt(clocks[x]);
+    node.classList.toggle('run', !over && chess.turn() === x && firstMoved[x]);
+    node.classList.toggle('low', clocks[x] < 5000);
+  }
+}
+
+// Lichess rule the model was trained on: each side's first move is untimed.
+// Driven by a timer, not requestAnimationFrame: browsers pause animation frames
+// in hidden tabs, which would freeze the clocks and miss flag-falls.
+let clockTimer = null;
+function tick() {
+  if (over) return;
+  const now = performance.now(), x = chess.turn();
+  if (firstMoved[x]) clocks[x] -= now - lastTick;
+  lastTick = now;
+  if (clocks[x] <= 0) {
+    clocks[x] = 0;
+    finish(x === 'w' ? '0-1' : '1-0', `${name(x)} flagged`);
+  }
+  renderClocks();
+}
+
+function moveMade(x) {           // x just moved: settle its clock exactly
+  const now = performance.now();
+  if (firstMoved[x]) clocks[x] -= now - lastTick;
+  lastTick = now;
+  firstMoved[x] = true;
+  plyClock.push(Math.max(clocks[x], 0));
+}
+
+function renderMoves() {
+  const h = chess.history();
+  let html = '';
+  for (let i = 0; i < h.length; i += 2) {
+    const cell = (j) => h[j] === undefined ? '<span></span>' :
+      `<span>${h[j]}${plyThink[j] != null ? ` <span class="think">${plyThink[j].toFixed(2)}s</span>` : ''}</span>`;
+    html += `<div class="row"><span class="n">${i / 2 + 1}.</span>${cell(i)}${cell(i + 1)}</div>`;
+  }
+  $('moves').innerHTML = html;
+  $('moves').scrollTop = $('moves').scrollHeight;
+}
+
+function checkEnd() {
+  if (!chess.isGameOver()) return false;
+  if (chess.isCheckmate()) {
+    const loser = chess.turn(), winner = loser === 'w' ? 'b' : 'w';
+    finish(loser === 'w' ? '0-1' : '1-0', `checkmate — ${name(winner)} won`);
+  } else {
+    const why = chess.isStalemate() ? 'stalemate' : chess.isThreefoldRepetition() ? 'threefold repetition'
+      : chess.isInsufficientMaterial() ? 'insufficient material' : 'draw';
+    finish('1/2-1/2', why);
+  }
+  return true;
+}
+
+// After any move: hand the turn to whoever is to move next.
+function next() {
+  if (checkEnd()) return;
+  const x = chess.turn();
+  if (bots.has(x)) botTurn(x);
+  else { $('status').textContent = ''; cg.playPremove(); }   // a queued premove fires humanMoved
+}
+
+function humanMoved(orig, dest) {
+  if (over || !human || chess.turn() !== s(human)) return;
+  try { chess.move({ from: orig, to: dest, promotion: 'q' }); }   // auto-queen
+  catch { sync(); return; }
+  moveMade(s(human));
+  plyThink.push(null);
+  sync([orig, dest]);
+  renderMoves();
+  next();
+}
+
+async function botTurn(x) {
+  const id = gameId;
+  $('status').textContent = `${name(x)} is thinking…`;
+  const sent = performance.now();
+  const moves = chess.history({ verbose: true }).map(m => m.lan);
+  let reply;
+  try {
+    const r = await fetch('/api/move', { method: 'POST', body: JSON.stringify({
+      side: x, moves, wtime: Math.round(Math.max(clocks.w, 0)), btime: Math.round(Math.max(clocks.b, 0)) }) });
+    reply = await r.json();
+  } catch (e) { $('status').textContent = 'engine error: ' + e; return; }
+  if (over || id !== gameId) return;           // flagged/stopped while thinking
+  const u = reply.move;
+  chess.move({ from: u.slice(0, 2), to: u.slice(2, 4), promotion: u[4] || 'q' });
+  moveMade(x);
+  plyThink.push((performance.now() - sent) / 1000);
+  sync([u.slice(0, 2), u.slice(2, 4)]);
+  renderMoves();
+  $('status').textContent = '';
+  next();
+}
+
+function clk(ms) {
+  const t = ms / 1000, h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60);
+  return `${h}:${String(m).padStart(2, '0')}:${(t % 60).toFixed(1).padStart(4, '0')}`;
+}
+
+async function finish(result, reason) {
+  if (over) return;
+  over = true;
+  clearInterval(clockTimer);
+  cg.cancelPremove();
+  sync();
+  renderClocks();
+  $('status').textContent = `${result} · ${reason}`;
+  $('start').disabled = false;
+  $('resign').disabled = true;
+  const h = chess.history();
+  if (!h.length) return;                       // nothing worth saving
+  const pname = (x) => human && s(human) === x ? 'You' : `maia-tim ${info.version} (${eras[x]})`;
+  const tags = {
+    Event: human ? 'maia-tim local' : 'maia-tim self-play',
+    Date: new Date().toISOString().slice(0, 10).replaceAll('-', '.'),
+    White: pname('w'), Black: pname('b'), Result: result, TimeControl: `${tc}+0`,
+    Termination: reason, BotTemperature: $('temp').value,
+    BotMimicTime: String($('mimic').checked), BotModel: `maia-tim ${info.version}` + (info.epoch != null ? ` epoch ${info.epoch}` : ''),
+  };
+  let pgn = Object.entries(tags).map(([k, v]) => `[${k} "${v}"]`).join('\n') + '\n\n';
+  h.forEach((san, i) => {
+    if (i % 2 === 0) pgn += `${i / 2 + 1}. `;
+    pgn += `${san} { [%clk ${clk(plyClock[i])}] } `;
+  });
+  pgn += result + '\n';
+  try {
+    const r = await fetch('/api/save', { method: 'POST', body: JSON.stringify({ pgn }) });
+    $('status').textContent += ` · saved ${(await r.json()).saved}`;
+  } catch {}
+}
+
+$('start').onclick = async () => {
+  gameId++;
+  tc = Number($('tc').value);
+  const watch = $('mode').value === 'watch';
+  const cfg = (sel) => ({ rating: Number(sel.value), temperature: Number($('temp').value),
+                          mimic: $('mimic').checked });
+  let payload;
+  if (watch) {
+    human = null;
+    bots = new Set(['w', 'b']);
+    eras = { w: eraLabel($('rating')), b: eraLabel($('rating2')) };
+    payload = { w: cfg($('rating')), b: cfg($('rating2')) };
+    orientation = 'white';
+  } else {
+    const pick = $('color').value;
+    human = pick === 'random' ? (Math.random() < 0.5 ? 'white' : 'black') : pick;
+    const bot = human === 'white' ? 'b' : 'w';
+    bots = new Set([bot]);
+    eras = { [bot]: eraLabel($('rating')) };
+    payload = { w: null, b: null, [bot]: cfg($('rating')), human_rating: Number($('opp').value) };
+    orientation = human;
+  }
+  await fetch('/api/new', { method: 'POST', body: JSON.stringify(payload) });
+  chess = new Chess();
+  clocks = { w: tc * 1000, b: tc * 1000 };
+  firstMoved = { w: false, b: false };
+  plyClock = []; plyThink = [];
+  over = false;
+  const bottom = s(orientation), top = bottom === 'w' ? 'b' : 'w';
+  $('name-top').textContent = name(top);
+  $('name-bottom').textContent = name(bottom);
+  cg.set({ orientation });
+  sync();
+  renderMoves();
+  $('start').disabled = true;
+  $('resign').disabled = false;
+  lastTick = performance.now();
+  clearInterval(clockTimer);
+  clockTimer = setInterval(tick, 50);
+  next();
+};
+
+$('resign').onclick = () => {
+  if (human) finish(human === 'white' ? '0-1' : '1-0', 'you resigned');
+  else finish('*', 'stopped');
+};
+</script>
+</body>
+</html>
