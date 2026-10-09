@@ -291,11 +291,11 @@ export async function loadModel(onStatus = () => {}) {
   }
   const ort = window.ort;
   ort.env.wasm.numThreads = 1;  // static hosting has no cross-origin isolation
-  const meta = await (await fetch('meta.json')).json();
+  const meta = await (await fetch('meta.json?v=41eace4bee')).json();
   const mb = (b) => (b / 1e6).toFixed(1);
   const sessions = {};
   for (const name of ['encode', 'time']) {
-    const bytes = await fetchWithProgress(`${name}.onnx`, (got, total) =>
+    const bytes = await fetchWithProgress(`${name}.onnx?v=41eace4bee`, (got, total) =>
       onStatus(`loading model: ${name} ${mb(got)}${total ? ' / ' + mb(total) : ''} MB`));
     sessions[name] = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'] });
   }
@@ -329,12 +329,8 @@ export async function createBackend(onStatus) {
       const move = await e.think(b.wtime, b.btime, 0, 0);
       return e.lastWdl ? { move, wdl: e.lastWdl } : { move };
     },
-    save: async (pgn) => {
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(new Blob([pgn], { type: 'application/x-chess-pgn' }));
-      a.download = `maia-tim-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.pgn`;
-      a.click();
-      return { saved: 'downloaded' };
-    },
+    // Nothing to store in the browser: the page offers the last game as a
+    // download button instead of saving it automatically.
+    save: async () => ({ saved: null }),
   };
 }

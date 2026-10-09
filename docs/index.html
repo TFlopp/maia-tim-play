@@ -36,6 +36,11 @@
   #moves .row { display:grid; grid-template-columns:28px 1fr 1fr; }
   #moves .n { color:var(--muted); }
   #moves .think { color:var(--muted); font-size:11px; }
+  #moves .mv { border-radius:3px; padding:0 3px; }
+  body.reviewing #moves .mv { cursor:pointer; }
+  body.reviewing #moves .mv:hover { background:#3a3835; }
+  #moves .mv.cur { background:var(--accent); color:#fff; }
+  #moves .mv.cur .think { color:#e8e6e3; }
   .info { color:var(--muted); font-size:12px; }
   #wdl-bar { display:flex; height:10px; border-radius:5px; overflow:hidden; background:#1b1a17; margin:6px 0 4px; }
   #wdl-bar span { display:block; height:100%; transition:width .3s; }
@@ -80,7 +85,8 @@
       <button id="start">Start game</button>
       <button id="resign" class="secondary" disabled style="margin-top:8px">Resign</button>
     </div>
-    <div class="panel"><div id="status"></div></div>
+    <div class="panel"><div id="status"></div>
+      <button id="pgn" class="secondary hidden" style="margin-top:8px">Download last game (PGN)</button></div>
     <div class="panel hidden" id="wdl" title="The model's own estimate, from the position, both clocks and both ratings, of how this game ends. Updated each time the bot moves.">
       <div id="wdl-head"></div>
       <div id="wdl-bar"><span class="a"></span><span class="d"></span><span class="b"></span></div>
@@ -98,7 +104,7 @@ import { Chess } from 'https://cdn.jsdelivr.net/npm/chess.js@1.0.0/+esm';
 const $ = (id) => document.getElementById(id);
 let chess, human = null, bots = new Set(), orientation = 'white', eras = {};
 let clocks, firstMoved, over = true, lastTick = 0, plyClock = [], plyThink = [];
-let tc = 30, info = {}, gameId = 0;
+let tc = 30, info = {}, gameId = 0, lastPgn = null, paused = false;
 
 const cg = Chessground($('board'), {
   movable: { free: false, color: undefined, showDests: true,
@@ -121,7 +127,7 @@ const serverBackend = {
 };
 $('start').disabled = true;
 const backend = window.MAIA_STATIC
-  ? await (await import('./engine.js')).createBackend((msg) => { $('engine-info').textContent = msg; })
+  ? await (await import('./engine.js?v=41eace4bee')).createBackend((msg) => { $('engine-info').textContent = msg; })
   : serverBackend;
 $('start').disabled = false;
 
@@ -202,6 +208,7 @@ function renderClocks() {
 let clockTimer = null;
 function tick() {
   if (over) return;
+  if (paused) { lastTick = performance.now(); return; }   // the repaint wait is off the clock
   const now = performance.now(), x = chess.turn();
   if (firstMoved[x]) clocks[x] -= now - lastTick;
   lastTick = now;
@@ -225,12 +232,50 @@ function renderMoves() {
   let html = '';
   for (let i = 0; i < h.length; i += 2) {
     const cell = (j) => h[j] === undefined ? '<span></span>' :
-      `<span>${h[j]}${plyThink[j] != null ? ` <span class="think">${plyThink[j].toFixed(2)}s</span>` : ''}</span>`;
+      `<span class="mv" data-ply="${j + 1}">${h[j]}${plyThink[j] != null ? ` <span class="think">${plyThink[j].toFixed(2)}s</span>` : ''}</span>`;
     html += `<div class="row"><span class="n">${i / 2 + 1}.</span>${cell(i)}${cell(i + 1)}</div>`;
   }
   $('moves').innerHTML = html;
   $('moves').scrollTop = $('moves').scrollHeight;
 }
+
+// --- reviewing a finished game ---------------------------------------------
+// Click a move, or ← / → to step, ↑ to jump to the end, ↓ to the start. Only
+// once the game is over: during play the board always shows the live position.
+let viewPly = null;   // plies shown on the board; null = the live position
+
+function showPly(k) {
+  const hist = chess.history({ verbose: true });
+  k = Math.max(0, Math.min(hist.length, k));
+  const pos = new Chess();
+  for (let i = 0; i < k; i++) pos.move(hist[i].san);
+  viewPly = k;
+  cg.set({
+    fen: pos.fen(), turnColor: col(pos.turn()),
+    lastMove: k ? [hist[k - 1].from, hist[k - 1].to] : undefined,
+    check: pos.inCheck() ? col(pos.turn()) : false,
+    movable: { color: undefined, dests: new Map() },
+  });
+  document.querySelectorAll('#moves .mv').forEach((el) =>
+    el.classList.toggle('cur', Number(el.dataset.ply) === k));
+  const cur = document.querySelector('#moves .mv.cur');
+  if (cur) cur.scrollIntoView({ block: 'nearest' });
+}
+
+$('moves').addEventListener('click', (ev) => {
+  const el = ev.target.closest('.mv');
+  if (el && over && chess) showPly(Number(el.dataset.ply));
+});
+
+document.addEventListener('keydown', (ev) => {
+  if (!over || !chess || !chess.history().length) return;
+  if (['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement?.tagName)) return;
+  const end = chess.history().length, at = viewPly ?? end;
+  const to = { ArrowLeft: at - 1, ArrowRight: at + 1, ArrowUp: end, ArrowDown: 0 }[ev.key];
+  if (to === undefined) return;
+  ev.preventDefault();
+  showPly(to);
+});
 
 function checkEnd() {
   if (!chess.isGameOver()) return false;
@@ -267,6 +312,18 @@ function humanMoved(orig, dest) {
 async function botTurn(x) {
   const id = gameId;
   $('status').textContent = `${name(x)} is thinking…`;
+  // Let the browser draw the last move before thinking: the in-browser engine
+  // runs on this thread, so back-to-back instant answers would otherwise only
+  // ever paint the final position. Waits for one painted frame (or 50 ms, so a
+  // hidden tab, which paints no frames, keeps playing); not charged to a clock.
+  paused = true;
+  await new Promise((r) => {
+    const t = setTimeout(r, 50);
+    requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(t); r(); }));
+  });
+  paused = false;
+  lastTick = performance.now();
+  if (over || id !== gameId) return;
   const sent = performance.now();
   const moves = chess.history({ verbose: true }).map(m => m.lan);
   let reply;
@@ -312,6 +369,8 @@ function clk(ms) {
 async function finish(result, reason) {
   if (over) return;
   over = true;
+  viewPly = null;
+  document.body.classList.add('reviewing');   // moves become clickable
   clearInterval(clockTimer);
   cg.cancelPremove();
   sync();
@@ -335,10 +394,23 @@ async function finish(result, reason) {
     pgn += `${san} { [%clk ${clk(plyClock[i])}] } `;
   });
   pgn += result + '\n';
+  // The last finished game is always one click away; nothing downloads by itself.
+  lastPgn = pgn;
+  $('pgn').classList.remove('hidden');
   try {
-    $('status').textContent += ` · saved ${(await backend.save(pgn)).saved}`;
+    const saved = (await backend.save(pgn)).saved;   // the local server also keeps every game
+    if (saved) $('status').textContent += ` · saved ${saved}`;
   } catch {}
 }
+
+$('pgn').onclick = () => {
+  if (!lastPgn) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([lastPgn], { type: 'application/x-chess-pgn' }));
+  a.download = `maia-tim-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.pgn`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
 
 $('start').onclick = async () => {
   gameId++;
@@ -368,6 +440,9 @@ $('start').onclick = async () => {
   firstMoved = { w: false, b: false };
   plyClock = []; plyThink = [];
   $('wdl').classList.add('hidden');
+  viewPly = null;
+  paused = false;
+  document.body.classList.remove('reviewing');
   over = false;
   const bottom = s(orientation), top = bottom === 'w' ? 'b' : 'w';
   $('name-top').textContent = name(top);
