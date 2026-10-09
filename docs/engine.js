@@ -6,7 +6,8 @@ import { Chess } from 'https://cdn.jsdelivr.net/npm/chess.js@1.0.0/+esm';
 
 const ORT_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js';
 const HISTORY = 8;
-const N_PLANES = 17 + 2 * HISTORY;
+const N_PLANES = 17 + 2 * HISTORY;       // planes of every version; v7 may append boards
+const N_BOARD = 12;                      // planes per previous board (v7 board history)
 const N_POLICY = 4096;
 const PREMOVE_S = 0.10, T_MAX = 30.0, N_FINE = 40, N_TIME = N_FINE + 1;
 const LOG_EDGES = Array.from({ length: N_FINE + 1 }, (_, i) =>
@@ -21,19 +22,36 @@ const flipSq = (i) => (i < 0 ? i : (7 - (i >> 3)) * 8 + (i & 7));
 // r: { board[64] piece codes (0 empty, 1-6 white PNBRQK, 7-12 black),
 //      meta[10]: me_white, wK, wQ, bK, bQ, ep, my_clock, opp_clock, base, inc,
 //      rating, oppRating, ply, bzMe, bzOpp, isTim,
-//      hfrom[8], hto[8], hcap[8], ht[8] }   (index 0 = most recent ply)
+//      hfrom[8], hto[8], hcap[8], ht[8]     (index 0 = most recent ply)
+//      v7, when the layout asks for it:
+//      xpresent / xht / xcap[timeHist - 8]: plies 9.. of the same history,
+//      hboard[boardHist][64]: the boards 1..boardHist plies ago (0s = none) }
+export const dims = (layout) => {
+  const th = layout.time_hist ?? HISTORY, bh = layout.board_hist ?? 0;
+  return { timeHist: th, boardHist: bh, nPlanes: N_PLANES + N_BOARD * bh,
+           nCtx: layout.n_base + 4 * HISTORY + 4 * Math.max(th - HISTORY, 0) };
+};
+
+// One board into the planes at `plane0`, in the mover's view: mirrored for
+// black, colours swapped so "my pieces" are always codes 1-6.
+function putBoard(x, board, white, plane0) {
+  for (let sq = 0; sq < 64; sq++) {
+    let v = board[white ? sq : flipSq(sq)];
+    if (!v) continue;
+    if (!white) v = v <= 6 ? v + 6 : v - 6;
+    x[(plane0 + v - 1) * 64 + sq] = 1;
+  }
+}
+
 export function buildInputs(r, layout) {
-  const x = new Float32Array(N_PLANES * 64);
-  const nBase = layout.n_base, nCtx = nBase + 4 * HISTORY;
+  const d = dims(layout);
+  const x = new Float32Array(d.nPlanes * 64);
+  const nBase = layout.n_base, nCtx = d.nCtx, nOld = nBase + 4 * HISTORY;
   const c = new Float32Array(nCtx);
   const meta = r.meta, white = meta[0] > 0.5;
 
-  for (let sq = 0; sq < 64; sq++) {
-    let v = r.board[white ? sq : flipSq(sq)];
-    if (!v) continue;
-    if (!white) v = v <= 6 ? v + 6 : v - 6;
-    x[(v - 1) * 64 + sq] = 1;
-  }
+  putBoard(x, r.board, white, 0);
+  for (let m = 0; m < d.boardHist; m++) putBoard(x, r.hboard[m], white, N_PLANES + N_BOARD * m);
   const [wk, wq, bk, bq] = [meta[1], meta[2], meta[3], meta[4]];
   const fill = (plane, val) => { if (val) x.fill(val, plane * 64, plane * 64 + 64); };
   fill(12, white ? wk : bk); fill(13, white ? wq : bq);
@@ -73,6 +91,15 @@ export function buildInputs(r, layout) {
     c[nBase + 2 * HISTORY + k] = (Math.log1p(Math.max(r.ht[k], 0)) / 2) * known;
     c[nBase + 3 * HISTORY + k] = CAP_VALUE[r.hcap[k]] / 9;
   }
+  const extra = d.timeHist - HISTORY;   // v7: the same four values further back, appended
+  for (let e = 0; e < extra; e++) {
+    const present = r.xpresent[e] ? 1 : 0;
+    const known = r.xht[e] >= 0 && present ? 1 : 0;
+    c[nOld + e] = present;
+    c[nOld + extra + e] = known;
+    c[nOld + 2 * extra + e] = (Math.log1p(Math.max(r.xht[e], 0)) / 2) * known;
+    c[nOld + 3 * extra + e] = CAP_VALUE[r.xcap[e]] / 9;
+  }
   return { x, c };
 }
 
@@ -103,11 +130,21 @@ function sample(logits, temperature) {
   return w.length - 1;
 }
 
+// White-oriented piece codes of a chess.js position (square 0 = a1).
+function boardArray(ch) {
+  const board = new Array(64).fill(0), rows = ch.board();
+  for (let rr = 0; rr < 8; rr++) for (let f = 0; f < 8; f++) {
+    const p = rows[rr][f];
+    if (p) board[(7 - rr) * 8 + f] = PIECE_TYPE[p.type] + (p.color === 'b' ? 6 : 0);
+  }
+  return board;
+}
+
 // --- engine ------------------------------------------------------------------
 export class Engine {
   constructor(ort, sessions, meta) {
     this.ort = ort; this.enc = sessions.encode; this.tim = sessions.time;
-    this.layout = meta.layout;
+    this.layout = meta.layout; this.dims = dims(meta.layout);
     this.calPolicy = meta.temp_policy ?? 1; this.calTime = meta.temp_time ?? 1;
     this.rating = meta.default_rating; this.oppRating = null;
     this.temperature = 1; this.mimic = true;
@@ -115,13 +152,14 @@ export class Engine {
   }
 
   newGame() {
-    this.chess = new Chess(); this.caps = []; this.secs = new Map();
+    this.chess = new Chess(); this.caps = []; this.boards = []; this.secs = new Map();
     this.base = null; this.bzMe = false; this.bzOpp = false; this.lastGo = null;
   }
 
   setPosition(moves) {
-    this.chess = new Chess(); this.caps = [];
+    this.chess = new Chess(); this.caps = []; this.boards = [];
     for (const u of moves) {
+      this.boards.push(boardArray(this.chess));     // the position before each move
       const m = this.chess.move({ from: u.slice(0, 2), to: u.slice(2, 4), promotion: u[4] || 'q' });
       this.caps.push(m.captured ? PIECE_TYPE[m.captured] : 0);
     }
@@ -143,12 +181,7 @@ export class Engine {
       this.secs.set(n - 1, Math.max(this.lastGo[2] - opp + inc, 0));
     }
 
-    const board = new Array(64).fill(0);
-    const rows = ch.board();
-    for (let rr = 0; rr < 8; rr++) for (let f = 0; f < 8; f++) {
-      const p = rows[rr][f];
-      if (p) board[(7 - rr) * 8 + f] = PIECE_TYPE[p.type] + (p.color === 'b' ? 6 : 0);
-    }
+    const board = boardArray(ch);
     const castle = ch.fen().split(' ')[2];
     let ep = -1;  // set after ANY double pawn push, as python-chess does
     if (n) {
@@ -172,6 +205,23 @@ export class Engine {
       r.hcap[k] = this.caps[j] || 0;
       if (this.secs.has(j)) r.ht[k] = this.secs.get(j);
     }
+    const { timeHist, boardHist } = this.dims;
+    if (timeHist > HISTORY) {
+      const extra = timeHist - HISTORY;
+      r.xpresent = new Array(extra).fill(0);
+      r.xht = new Array(extra).fill(-1);
+      r.xcap = new Array(extra).fill(0);
+      for (let k = HISTORY; k < Math.min(timeHist, n); k++) {
+        const j = n - 1 - k, e = k - HISTORY;
+        r.xpresent[e] = 1;
+        r.xcap[e] = this.caps[j] || 0;
+        if (this.secs.has(j)) r.xht[e] = this.secs.get(j);
+      }
+    }
+    if (boardHist > 0) {
+      r.hboard = [];
+      for (let m = 1; m <= boardHist; m++) r.hboard.push(m <= n ? this.boards[n - m] : new Array(64).fill(0));
+    }
     this.lastGo = [n, my, opp];
     return r;
   }
@@ -191,11 +241,13 @@ export class Engine {
     const mask = new Uint8Array(N_POLICY);
     for (const m of legal) mask[m.idx] = 1;
     const out = await this.enc.run({
-      x: new ort.Tensor('float32', x, [1, N_PLANES, 8, 8]),
+      x: new ort.Tensor('float32', x, [1, this.dims.nPlanes, 8, 8]),
       c: new ort.Tensor('float32', c, [1, c.length]),
       mask: new ort.Tensor('bool', mask, [1, N_POLICY]),
     });
     const logits = legal.map((m) => out.p.data[m.idx] / this.calPolicy);
+    // The result head's [loss, draw, win] for the bot, when the export has it.
+    this.lastWdl = out.v ? Array.from(out.v.data, (u) => Math.round(u * 1e4) / 1e4) : null;
     const k = sample(logits, this.temperature);
 
     if (this.mimic && (wtime > 0 || btime > 0)) {
@@ -274,7 +326,8 @@ export async function createBackend(onStatus) {
     move: async (b) => {
       const e = engines[b.side || 'w'];
       e.setPosition(b.moves || []);
-      return { move: await e.think(b.wtime, b.btime, 0, 0) };
+      const move = await e.think(b.wtime, b.btime, 0, 0);
+      return e.lastWdl ? { move, wdl: e.lastWdl } : { move };
     },
     save: async (pgn) => {
       const a = document.createElement('a');

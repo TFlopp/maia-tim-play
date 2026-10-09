@@ -37,6 +37,13 @@
   #moves .n { color:var(--muted); }
   #moves .think { color:var(--muted); font-size:11px; }
   .info { color:var(--muted); font-size:12px; }
+  #wdl-bar { display:flex; height:10px; border-radius:5px; overflow:hidden; background:#1b1a17; margin:6px 0 4px; }
+  #wdl-bar span { display:block; height:100%; transition:width .3s; }
+  #wdl-bar .a { background:var(--hi); }
+  #wdl-bar .d { background:var(--muted); }
+  #wdl-bar .b { background:var(--accent); }
+  #wdl-text { display:flex; justify-content:space-between; font-size:12px; }
+  #wdl-head { color:var(--hi); font-weight:600; }
   h1 { font-size:15px; margin:0 0 4px; color:var(--hi); }
   .hidden { display:none; }
 </style>
@@ -74,6 +81,11 @@
       <button id="resign" class="secondary" disabled style="margin-top:8px">Resign</button>
     </div>
     <div class="panel"><div id="status"></div></div>
+    <div class="panel hidden" id="wdl" title="The model's own estimate, from the position, both clocks and both ratings, of how this game ends. Updated each time the bot moves.">
+      <div id="wdl-head"></div>
+      <div id="wdl-bar"><span class="a"></span><span class="d"></span><span class="b"></span></div>
+      <div id="wdl-text"><span id="wdl-a"></span><span id="wdl-d"></span><span id="wdl-b"></span></div>
+    </div>
     <div class="panel"><div id="moves"></div></div>
   </div>
 </main>
@@ -263,6 +275,7 @@ async function botTurn(x) {
       wtime: Math.round(Math.max(clocks.w, 0)), btime: Math.round(Math.max(clocks.b, 0)) });
   } catch (e) { $('status').textContent = 'engine error: ' + e; return; }
   if (over || id !== gameId) return;           // flagged/stopped while thinking
+  if (reply.wdl) showWdl(x, reply.wdl);
   const u = reply.move;
   chess.move({ from: u.slice(0, 2), to: u.slice(2, 4), promotion: u[4] || 'q' });
   moveMade(x);
@@ -271,6 +284,24 @@ async function botTurn(x) {
   renderMoves();
   $('status').textContent = '';
   next();
+}
+
+// The bot's result estimate ([loss, draw, win] for the side that just moved).
+// Playing: the bot's chances against you. Watching: White's vs Black's.
+function showWdl(x, [loss, draw, win]) {
+  let a = win, b = loss, la = 'maia-tim', lb = 'you';
+  if (!human) {
+    [a, b] = x === 'w' ? [win, loss] : [loss, win];
+    [la, lb] = [`White (${eras.w})`, `Black (${eras.b})`];
+  }
+  const pct = (v) => `${Math.round(v * 100)}%`;
+  $('wdl').classList.remove('hidden');
+  $('wdl-head').textContent = human ? `Bot confidence: ${pct(win)} to win` : 'Predicted result';
+  const bar = $('wdl-bar').children;
+  bar[0].style.width = pct(a); bar[1].style.width = pct(draw); bar[2].style.width = pct(b);
+  $('wdl-a').textContent = `${la} ${pct(a)}`;
+  $('wdl-d').textContent = `draw ${pct(draw)}`;
+  $('wdl-b').textContent = `${lb} ${pct(b)}`;
 }
 
 function clk(ms) {
@@ -336,6 +367,7 @@ $('start').onclick = async () => {
   clocks = { w: tc * 1000, b: tc * 1000 };
   firstMoved = { w: false, b: false };
   plyClock = []; plyThink = [];
+  $('wdl').classList.add('hidden');
   over = false;
   const bottom = s(orientation), top = bottom === 'w' ? 'b' : 'w';
   $('name-top').textContent = name(top);

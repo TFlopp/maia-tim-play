@@ -7,6 +7,7 @@ import chess
 import numpy as np
 import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import botcore
 import net as N
 CKPT = pathlib.Path(__file__).resolve().parent / "weights.pt"
 DEFAULT_RATING = 2450
@@ -18,7 +19,7 @@ class Engine:
         self.dev = 'cuda' if torch.cuda.is_available() else 'cpu'
         ck = torch.load(CKPT, map_location=self.dev, weights_only=False)
         a = ck['args']
-        self.model = N.MaiaTim(a['channels'], a['blocks']).to(self.dev).eval()
+        self.model = N.from_args(a).to(self.dev).eval()
         self.model.load_state_dict(ck['model'])
         self.cal_policy = float(ck.get('temp_policy', 1.0))
         self.cal_time = float(ck.get('temp_time', 1.0))
@@ -26,6 +27,8 @@ class Engine:
         self.mimic_time = True
         self.rating = DEFAULT_RATING
         self.opp_rating = None
+        self.time_cap = 0.0
+        self.own_time_memory = False
         self.new_game()
 
     def new_game(self):
@@ -64,7 +67,7 @@ class Engine:
             (prev_ply, _, prev_opp) = self.last_go
             if prev_ply == n - 2:
                 self.secs[n - 1] = max(prev_opp - opp + inc, 0.0)
-        r = {'board': np.zeros((1, 64), np.uint8), 'meta': np.array([[1.0 if white else 0.0, float(b.has_kingside_castling_rights(chess.WHITE)), float(b.has_queenside_castling_rights(chess.WHITE)), float(b.has_kingside_castling_rights(chess.BLACK)), float(b.has_queenside_castling_rights(chess.BLACK)), float(b.ep_square if b.ep_square is not None else -1), my, opp, self.base, inc]], np.float32), 'rating': np.array([self.rating]), 'opp_rating': np.array([self.opp_rating or self.rating]), 'ply': np.array([b.ply()]), 'bz_me': np.array([int(self.bz_me)]), 'bz_opp': np.array([int(self.bz_opp)]), 'hfrom': np.full((1, N.HISTORY), -1, np.int8), 'hto': np.full((1, N.HISTORY), -1, np.int8), 'hcap': np.zeros((1, N.HISTORY), np.uint8), 'ht': np.full((1, N.HISTORY), -1.0, np.float32)}
+        r = {'board': np.zeros((1, 64), np.uint8), 'meta': np.array([[1.0 if white else 0.0, float(b.has_kingside_castling_rights(chess.WHITE)), float(b.has_queenside_castling_rights(chess.WHITE)), float(b.has_kingside_castling_rights(chess.BLACK)), float(b.has_queenside_castling_rights(chess.BLACK)), float(b.ep_square if b.ep_square is not None else -1), my, opp, self.base, inc]], np.float32), 'rating': np.array([self.rating]), 'opp_rating': np.array([self.opp_rating or self.rating]), 'ply': np.array([b.ply()]), 'bz_me': np.array([int(self.bz_me)]), 'bz_opp': np.array([int(self.bz_opp)]), 'is_tim': np.array([1]), 'hfrom': np.full((1, N.HISTORY), -1, np.int8), 'hto': np.full((1, N.HISTORY), -1, np.int8), 'hcap': np.zeros((1, N.HISTORY), np.uint8), 'ht': np.full((1, N.HISTORY), -1.0, np.float32)}
         for (sq, pc) in b.piece_map().items():
             r['board'][0, sq] = PIECE_CODE[pc.piece_type, pc.color]
         for k in range(min(N.HISTORY, n)):
@@ -75,43 +78,30 @@ class Engine:
             r['hcap'][0, k] = self.caps[j] if j < len(self.caps) else 0
             if j in self.secs:
                 r['ht'][0, k] = self.secs[j]
-        (x, c) = N.build_inputs(r)
+        (th, bh) = (self.model.time_hist, self.model.board_hist)
+        if th > N.HISTORY:
+            r['xpresent'] = np.zeros((1, th - N.HISTORY), np.uint8)
+            r['xht'] = np.full((1, th - N.HISTORY), -1.0, np.float32)
+            r['xcap'] = np.zeros((1, th - N.HISTORY), np.uint8)
+            for k in range(N.HISTORY, min(th, n)):
+                (j, e) = (n - 1 - k, k - N.HISTORY)
+                r['xpresent'][0, e] = 1
+                r['xcap'][0, e] = self.caps[j] if j < len(self.caps) else 0
+                if j in self.secs:
+                    r['xht'][0, e] = self.secs[j]
+        if bh > 0:
+            r['hboard'] = np.zeros((1, bh, 64), np.uint8)
+            past = b.copy()
+            for m in range(min(bh, n)):
+                past.pop()
+                for (sq, pc) in past.piece_map().items():
+                    r['hboard'][0, m, sq] = PIECE_CODE[pc.piece_type, pc.color]
+        (x, c) = N.build_inputs(r, th, bh)
         self.last_go = (n, my, opp)
         return (torch.from_numpy(x).to(self.dev), torch.from_numpy(c).to(self.dev), my)
 
-    @torch.no_grad()
     def think(self, wtime, btime, winc, binc):
-        t0 = time.time()
-        (x, c, my_clock) = self.features(wtime, btime, winc, binc)
-        white = self.board.turn == chess.WHITE
-        legal = [m for m in self.board.legal_moves if m.promotion in (None, chess.QUEEN)]
-        idx = []
-        for mv in legal:
-            (f, to) = (mv.from_square, mv.to_square)
-            if not white:
-                (f, to) = (int(N.flip_sq(f)), int(N.flip_sq(to)))
-            idx.append(f * 64 + to)
-        mask = torch.zeros(1, N.N_POLICY, dtype=torch.bool, device=self.dev)
-        mask[0, idx] = True
-        (h, p_t, a) = self.model.encode(x, c, mask)
-        logits = p_t[0, idx].float().cpu().numpy() / self.cal_policy
-        if self.temperature <= 0:
-            choice = int(np.argmax(logits))
-        else:
-            z = logits / self.temperature
-            z = np.exp(z - z.max())
-            choice = int(np.random.choice(len(legal), p=z / z.sum()))
-        mv = legal[choice]
-        t = self.model.time_logits(h, p_t, a, torch.tensor([idx[choice]], device=self.dev))
-        if self.mimic_time and (wtime > 0 or btime > 0):
-            probs = torch.softmax(t[0].float() / self.cal_time, 0).cpu().numpy().astype(np.float64)
-            b = int(np.random.choice(len(probs), p=probs / probs.sum()))
-            target = min(N.sample_seconds(b), max(my_clock * 0.4, 0.0))
-            wait = target - (time.time() - t0)
-            if wait > 0:
-                time.sleep(wait)
-        self.secs[len(self.board.move_stack)] = time.time() - t0
-        return mv
+        return botcore.think(self, N, wtime, btime, winc, binc, temperature=self.temperature, mimic=self.mimic_time, cap=self.time_cap or None, hide_own=not self.own_time_memory)
 
 def main():
     eng = None
@@ -122,11 +112,13 @@ def main():
             continue
         cmd = tok[0]
         if cmd == 'uci':
-            out.write('id name maia-tim v4\nid author maia-tim-play\n')
+            out.write('id name maia-tim v7\nid author maia-tim-play\n')
             out.write('option name Temperature type spin default 100 min 0 max 300\n')
             out.write('option name MimicTime type check default true\n')
             out.write(f'option name Rating type spin default {DEFAULT_RATING} min 900 max 2600\n')
             out.write('option name OppRating type spin default 0 min 0 max 3500\n')
+            out.write('option name TimeCap type spin default 0 min 0 max 90\n')
+            out.write('option name OwnTimeMemory type check default false\n')
             out.write('uciok\n')
         elif cmd == 'isready':
             if eng is None:
@@ -145,6 +137,10 @@ def main():
                 eng.rating = int(val)
             elif name == 'OppRating':
                 eng.opp_rating = int(val) or None
+            elif name == 'TimeCap':
+                eng.time_cap = int(val) / 100.0
+            elif name == 'OwnTimeMemory':
+                eng.own_time_memory = val.lower() == 'true'
         elif cmd == 'ucinewgame':
             if eng is None:
                 eng = Engine()

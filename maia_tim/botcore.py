@@ -4,7 +4,7 @@ import chess
 import numpy as np
 import torch
 
-def think(eng, N, wtime, btime, winc, binc, *, temperature=1.0, mimic=True, cap=None, hide_own=True):
+def think(eng, N, wtime, btime, winc, binc, *, temperature=1.0, mimic=True, cap=None, hide_own=True, info=None):
     t0 = time.time()
     board = eng.board
     n = len(board.move_stack)
@@ -35,6 +35,8 @@ def think(eng, N, wtime, btime, winc, binc, *, temperature=1.0, mimic=True, cap=
             z = np.exp(z - z.max())
             choice = int(np.random.choice(len(legal), p=z / z.sum()))
         t = eng.model.time_logits(h, p, a, torch.tensor([idx[choice]], device=eng.dev))
+        if info is not None:
+            info['wdl'] = [round(float(v), 4) for v in torch.softmax(eng.model.v_fc(a)[0].float(), 0)]
     if mimic and (wtime > 0 or btime > 0):
         probs = torch.softmax(t[0].float() / getattr(eng, 'cal_time', 1.0), 0)
         probs = probs.cpu().numpy().astype(np.float64)

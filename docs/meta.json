@@ -1,5 +1,5 @@
 {
- "version": "v4",
+ "version": "v7",
  "step": 50,
  "default_rating": 2450,
  "eras": [
@@ -27,9 +27,11 @@
   2450
  ],
  "layout": {
-  "n_base": 13,
-  "is_tim": false
+  "n_base": 14,
+  "is_tim": true,
+  "time_hist": 24,
+  "board_hist": 7
  },
- "temp_policy": 1.0,
- "temp_time": 1.0
+ "temp_policy": 0.9440251859223101,
+ "temp_time": 1.022835196104145
 }

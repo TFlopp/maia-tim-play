@@ -78,11 +78,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/move":
             b = self._body()
             eng = self.engines[b.get("side", "w")]
+            stats = {}
             with self.lock:
                 eng.set_position(None, b.get("moves", []))
                 mv = botcore.think(eng, engine.N, int(b["wtime"]), int(b["btime"]), 0, 0,
-                                   temperature=eng.temperature, mimic=eng.mimic_time)
-            self._json({"move": mv.uci()})
+                                   temperature=eng.temperature, mimic=eng.mimic_time, info=stats)
+            self._json({"move": mv.uci(), **stats})
         elif self.path == "/api/save":
             b = self._body()
             GAMES.mkdir(parents=True, exist_ok=True)
